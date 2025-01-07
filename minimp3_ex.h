@@ -23,10 +23,14 @@
 /* compile-time config */
 #define MINIMP3_PREDECODE_FRAMES 2 /* frames to pre-decode and skip after seek (to fill internal structures) */
 /*#define MINIMP3_SEEK_IDX_LINEAR_SEARCH*/ /* define to use linear index search instead of binary search on seek */
-#define MINIMP3_IO_SIZE (128*1024) /* io buffer size for streaming functions, must be greater than MINIMP3_BUF_SIZE */
+#define MINIMP3_IO_SIZE (64*1024) /* io buffer size for streaming functions, must be greater than MINIMP3_BUF_SIZE */
 #define MINIMP3_BUF_SIZE (16*1024) /* buffer which can hold minimum 10 consecutive mp3 frames (~16KB) worst case */
 /*#define MINIMP3_SCAN_LIMIT (256*1024)*/ /* how many bytes will be scanned to search first valid mp3 frame, to prevent stall on large non-mp3 files */
 #define MINIMP3_ENABLE_RING 0      /* WIP enable hardware magic ring buffer if available, to make less input buffer memmove(s) in callback IO mode */
+
+#define MINIMP3_INIT_INDEX_BUF_SIZE_FRAMES (8*1024) /* initial index buffer size in frames */
+#define MINIMP3_MAX_INDEX_BUF_SIZE_FRAMES (64*1024) /* maximum index buffer size in frames */
+#define MINIMP3_INDEX_BUF_SIZE_MULTIPLIER 2         /* index buffer resize multiplier */
 
 /* return error codes */
 #define MP3D_E_PARAM   -1
@@ -48,10 +52,13 @@ typedef struct
     size_t size;
 } mp3dec_map_info_t;
 
+/* Note: both of these fields should be 64-bit wide (uint64_t), but we don't have enough heap
+ * in Harmony, so the decoder keeps crashing the OS for large files. Let's use 32-bit variables
+ * we can afford and hope for the best... Dirty hack, but it seems to work. */
 typedef struct
 {
-    uint64_t sample;
-    uint64_t offset;
+    uint32_t sample;
+    uint32_t offset;
 } mp3dec_frame_t;
 
 typedef struct
@@ -650,13 +657,19 @@ static int mp3dec_load_index(void *user_data, const uint8_t *frame, int frame_si
         return MP3D_E_USER;
     if (dec->index.num_frames + 1 > dec->index.capacity)
     {
-        if (!dec->index.capacity)
-            dec->index.capacity = 4096;
-        else
-            dec->index.capacity *= 2;
-        mp3dec_frame_t *alloc_buf = (mp3dec_frame_t *)realloc((void*)dec->index.frames, sizeof(mp3dec_frame_t)*dec->index.capacity);
-        if (!alloc_buf)
+        if (dec->index.capacity == 0) {
+            dec->index.capacity = MINIMP3_INIT_INDEX_BUF_SIZE_FRAMES;
+        }
+        else if (dec->index.capacity < MINIMP3_MAX_INDEX_BUF_SIZE_FRAMES) {
+            dec->index.capacity *= MINIMP3_INDEX_BUF_SIZE_MULTIPLIER;
+        }
+        else {
             return MP3D_E_MEMORY;
+        }
+        mp3dec_frame_t *alloc_buf = (mp3dec_frame_t *)realloc((void*)dec->index.frames, sizeof(mp3dec_frame_t)*dec->index.capacity);
+        if (!alloc_buf) {
+            return MP3D_E_MEMORY;
+        }
         dec->index.frames = alloc_buf;
     }
     idx_frame = &dec->index.frames[dec->index.num_frames++];
@@ -717,7 +730,9 @@ static size_t mp3dec_idx_binary_search(mp3dec_index_t *idx, uint64_t position)
 
 int mp3dec_ex_seek(mp3dec_ex_t *dec, uint64_t position)
 {
+    int status = 0;
     size_t i;
+
     if (!dec)
         return MP3D_E_PARAM;
     if (!(dec->flags & MP3D_SEEK_TO_SAMPLE))
@@ -748,16 +763,34 @@ seek_zero:
         dec->buffer_samples = 0;
         if (dec->io)
         {
-            if (dec->io->seek(dec->start_offset, dec->io->seek_data))
+            if (dec->io->seek(dec->start_offset, dec->io->seek_data)) {
                 return MP3D_E_IOERROR;
+            }
             int ret = mp3dec_iterate_cb(dec->io, (uint8_t *)dec->file.buffer, dec->file.size, mp3dec_load_index, dec);
-            if (ret && MP3D_E_USER != ret)
-                return ret;
-        } else
+            if (ret) {
+                if (ret == MP3D_E_MEMORY) {
+                    dec->indexes_built = 0; // Indexes not build due to insufficient memory, seek to zero
+                    status = MP3D_E_MEMORY;
+                    goto seek_zero;
+                }
+                else if (ret != MP3D_E_USER) {
+                    return ret;
+                }
+            }
+        }
+        else
         {
             int ret = mp3dec_iterate_buf(dec->file.buffer + dec->start_offset, dec->file.size - dec->start_offset, mp3dec_load_index, dec);
-            if (ret && MP3D_E_USER != ret)
-                return ret;
+            if (ret) {
+                if (ret == MP3D_E_MEMORY) {
+                    dec->indexes_built = 0; // Indexes not build due to insufficient memory, seek to zero
+                    status = MP3D_E_MEMORY;
+                    goto seek_zero;
+                }
+                else if (ret != MP3D_E_USER) {
+                    return ret;
+                }
+            }
         }
         for (i = 0; i < dec->index.num_frames; i++)
             dec->index.frames[i].offset += dec->start_offset;
@@ -850,7 +883,7 @@ do_exit:
     dec->input_filled    = 0;
     dec->last_error      = 0;
     mp3dec_init(&dec->mp3d);
-    return 0;
+    return status;
 }
 
 size_t mp3dec_ex_read_frame(mp3dec_ex_t *dec, mp3d_sample_t **buf, mp3dec_frame_info_t *frame_info, size_t max_samples)
